@@ -3,6 +3,7 @@ from pathlib import Path
 
 from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.responses import HTMLResponse
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.config import settings
@@ -15,11 +16,11 @@ from app.services.preprocessing import preprocess_record
 from app.services.sentiment import analyze_text
 
 
-Base.metadata.create_all(bind=engine)
-
 app = FastAPI(title=settings.app_name, version="1.0.0")
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 SAMPLE_DATA_PATH = PROJECT_ROOT / "sample_data" / "code_mixed_posts.jsonl"
+DATABASE_READY = True
+DATABASE_ERROR_MESSAGE = ""
 
 
 DEPLOY_DASHBOARD_HTML = """
@@ -287,11 +288,36 @@ def root_dashboard():
 
 @app.get("/health")
 def health_check():
-    return {"status": "ok", "app": settings.app_name, "environment": settings.app_env}
+    status = "ok" if DATABASE_READY else "degraded"
+    return {
+        "status": status,
+        "app": settings.app_name,
+        "environment": settings.app_env,
+        "database_ready": DATABASE_READY,
+        "database_error": DATABASE_ERROR_MESSAGE,
+    }
+
+
+@app.on_event("startup")
+def initialize_database():
+    global DATABASE_READY, DATABASE_ERROR_MESSAGE
+    try:
+        Base.metadata.create_all(bind=engine)
+        DATABASE_READY = True
+        DATABASE_ERROR_MESSAGE = ""
+    except SQLAlchemyError as exc:
+        DATABASE_READY = False
+        DATABASE_ERROR_MESSAGE = str(exc)
+
+
+def ensure_database_ready():
+    if not DATABASE_READY:
+        raise HTTPException(status_code=503, detail=f"Database unavailable: {DATABASE_ERROR_MESSAGE}")
 
 
 @app.post("/api/v1/ingest/sample", response_model=IngestResponse)
 def ingest_sample(db: Session = Depends(get_db)):
+    ensure_database_ready()
     if not SAMPLE_DATA_PATH.exists():
         raise HTTPException(status_code=404, detail="Sample data file not found.")
 
@@ -310,6 +336,7 @@ def ingest_sample(db: Session = Depends(get_db)):
 
 @app.post("/api/v1/ingest/json", response_model=IngestResponse)
 async def ingest_json(file: UploadFile = File(...), db: Session = Depends(get_db)):
+    ensure_database_ready()
     content = (await file.read()).decode("utf-8")
     inserted = 0
 
@@ -341,6 +368,7 @@ def analyze_posts(
     limit: int = Query(50, ge=1, le=500),
     db: Session = Depends(get_db),
 ):
+    ensure_database_ready()
     posts = db.query(Post).order_by(Post.id.desc()).limit(limit).all()
     if not posts:
         raise HTTPException(status_code=404, detail="No posts found. Ingest data first.")
@@ -368,11 +396,13 @@ def analyze_posts(
 
 @app.get("/api/v1/analytics/summary", response_model=SummaryResponse)
 def analytics_summary(db: Session = Depends(get_db)):
+    ensure_database_ready()
     return SummaryResponse(**build_summary(db))
 
 
 @app.get("/api/v1/posts")
 def list_posts(limit: int = Query(100, ge=1, le=500), db: Session = Depends(get_db)):
+    ensure_database_ready()
     posts = db.query(Post).order_by(Post.id.desc()).limit(limit).all()
     return [
         {
@@ -395,6 +425,7 @@ def list_results(
     limit: int = Query(100, ge=1, le=500),
     db: Session = Depends(get_db),
 ):
+    ensure_database_ready()
     query = db.query(AnalysisResult).order_by(AnalysisResult.id.desc())
     if provider:
         query = query.filter(AnalysisResult.provider == provider)
@@ -423,6 +454,7 @@ def benchmark(
     limit: int = Query(25, ge=1, le=200),
     db: Session = Depends(get_db),
 ):
+    ensure_database_ready()
     if provider_a == provider_b:
         raise HTTPException(status_code=400, detail="Choose two different providers for benchmarking.")
 
@@ -447,6 +479,7 @@ def benchmark(
 
 @app.get("/api/v1/benchmark/history")
 def benchmark_history(limit: int = Query(25, ge=1, le=200), db: Session = Depends(get_db)):
+    ensure_database_ready()
     history = db.query(BenchmarkRun).order_by(BenchmarkRun.id.desc()).limit(limit).all()
     return [
         {
